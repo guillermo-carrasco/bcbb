@@ -28,11 +28,14 @@ import glob
 import getpass
 import subprocess
 import time
+import sys
 from optparse import OptionParser
 import xml.etree.ElementTree as ET
 import re
 import csv
 from shutil import copyfile
+from multiprocessing import Pool
+from itertools import izip
 
 import logbook
 
@@ -42,6 +45,12 @@ from bcbio import utils
 from bcbio.distributed import messaging
 from bcbio.solexa.flowcell import (get_flowcell_info, get_fastq_dir, get_qseq_dir)
 from bcbio.pipeline.config_loader import load_config
+
+# Import functionality to convert MiSeq samplesheets from the scilifelab repo (if available)
+try:
+    from scilifelab.illumina.miseq import MiSeqRun
+except ImportError:
+    pass
 
 LOG_NAME = os.path.splitext(os.path.basename(__file__))[0]
 log = logbook.Logger(LOG_NAME)
@@ -69,7 +78,7 @@ def search_for_new(*args, **kwargs):
         if os.path.isdir(dname) and \
         ((kwargs.get("run_id",None) is None and not any(dir.startswith(dname) for dir in reported)) or \
          kwargs.get("run_id",None) == os.path.basename(dname)):
-        
+
             # Injects run_name on logging calls.
             # Convenient for run_name on "Subject" for email notifications
             def run_setter(record):
@@ -94,8 +103,7 @@ def search_for_new(*args, **kwargs):
                 # Re-read the reported database to make sure it hasn't
                 # changed while processing.
                 reported = _read_reported(config["msg_db"])
-
-
+    
 def initial_processing(*args, **kwargs):
     """Initial processing to be performed after the first base report
     """
@@ -115,7 +123,17 @@ def initial_processing(*args, **kwargs):
                                     os.path.dirname(ss_file),
                                     os.path.dirname(dst),
                                     e))
-            
+    # If this is a MiSeq run and we have the scilifelab modules loaded,
+    # convert the MiSeq samplesheet into a format compatible with casava
+    elif _is_miseq_run(dname):
+        if 'scilifelab.illumina.miseq' in sys.modules:
+            mrun = MiSeqRun(dname)
+            hiseq_ssheet = os.path.join(dname,'{}.csv'.format(_get_flowcell_id(dname)))
+            mrun.write_hiseq_samplesheet(hiseq_ssheet)
+        # If the module wasn't loaded, there's nothing we can do, so warn
+        else:
+            logger2.error("The necessary dependencies for processing MiSeq runs with CASAVA could not be loaded")
+    
     # Upload the necessary files
     loc_args = args + (None, )
     _post_process_run(*loc_args, **{"fetch_msg": kwargs.get("fetch_msg", False),
@@ -140,20 +158,22 @@ def process_first_read(*args, **kwargs):
 
             # Touch the indicator flag that processing of read1 has been started
             utils.touch_indicator_file(os.path.join(dname, "first_read_processing_started.txt"))
-            unaligned_dir = _generate_fastq_with_casava(dname, config, r1=True)
+            unaligned_dirs = _generate_fastq_with_casava(dname, config, r1=True)
             logger2.info("Done generating fastq.gz files for read 1 of {:s}".format(dname))
 
             # Extract the top barcodes from the undemultiplexed fraction
-            if config["program"].get("extract_barcodes", None):
-                extract_top_undetermined_indexes(dname, unaligned_dir, config)
+            for unaligned_dir in unaligned_dirs:
+                if config["program"].get("extract_barcodes", None):
+                    extract_top_undetermined_indexes(dname, unaligned_dir, config)
 
-        unaligned_dir = os.path.join(dname, "Unaligned")
-        loc_args = args + (unaligned_dir,)
-        _post_process_run(*loc_args, **{"fetch_msg": kwargs.get("fetch_msg", False),
-                                        "process_msg": False,
-                                        "store_msg": kwargs.get("store_msg", False),
-                                        "backup_msg": kwargs.get("backup_msg", False),
-                                        "push_data": kwargs.get("push_data", False)})
+        for unaligned_dir in unaligned_dirs:
+            unaligned_dir = os.path.join(dname, "Unaligned")
+            loc_args = args + (unaligned_dir,)
+            _post_process_run(*loc_args, **{"fetch_msg": kwargs.get("fetch_msg", False),
+                                            "process_msg": False,
+                                            "store_msg": kwargs.get("store_msg", False),
+                                            "backup_msg": kwargs.get("backup_msg", False),
+                                            "push_data": kwargs.get("push_data", False)})
 
         # Touch the indicator flag that processing of read1 has been completed
         utils.touch_indicator_file(os.path.join(dname, "first_read_processing_completed.txt"))
@@ -207,7 +227,7 @@ def extract_top_undetermined_indexes(fc_dir, unaligned_dir, config):
     """
     infile_glob = os.path.join(unaligned_dir, "Undetermined_indices", "Sample_lane*", "*_R1_*.fastq.gz")
     infiles = glob.glob(infile_glob)
-
+    
     # Only run as many simultaneous processes as number of cores specified in config
     procs = []
     num_cores = config["algorithm"].get("num_cores", 1)
@@ -261,7 +281,8 @@ def extract_top_undetermined_indexes(fc_dir, unaligned_dir, config):
         os.unlink(p[2])
 
     # Write the metrics to one output file
-    metricfile = os.path.join(fc_dir, "Unaligned", "Basecall_Stats_{}".format(fc_dir.split("_")[-1][1:]), "Undemultiplexed_stats.metrics")
+    fcid = _get_flowcell_id(fc_dir)
+    metricfile = os.path.join(unaligned_dir, "Basecall_Stats_{}".format(fcid), "Undemultiplexed_stats.metrics")
     with open(metricfile, "w") as fh:
         w = csv.DictWriter(fh, fieldnames=header, dialect=csv.excel_tab)
         w.writeheader()
@@ -318,13 +339,13 @@ def _post_process_run(dname, config, config_file, fastq_dir, **kwargs):
 def simple_upload(remote_info, data):
     """Upload generated files to specified host using rsync
     """
-    include = []
+    include = ['--include=*/']
     for fcopy in data['to_copy']:
         include.extend(["--include", "{}**/*".format(fcopy)])
         include.append("--include={}".format(fcopy))
-        # By including both these patterns we get the entire directory
-        # if a directory is given, or a single file if a single file is
-        # given.
+    # By including both these patterns we get the entire directory
+    # if a directory is given, or a single file if a single file is
+    # given.
 
     cl = ["rsync", \
           "--checksum", \
@@ -335,9 +356,8 @@ def simple_upload(remote_info, data):
           ]
 
     # file / dir inclusion specification
-    cl.extend(["--include", "*/"])
     cl.extend(include)
-    cl.extend(["--exclude", "*"])
+    cl.append("--exclude=*")
 
     # source and target
     cl.extend([
@@ -346,7 +366,7 @@ def simple_upload(remote_info, data):
           # target
           "{store_user}@{store_host}:{store_dir}".format(**remote_info)
          ])
-    
+
     logdir = remote_info.get("log_dir",os.getcwd())
     rsync_out = os.path.join(logdir,"rsync_transfer.out")
     rsync_err = os.path.join(logdir,"rsync_transfer.err")
@@ -399,14 +419,27 @@ def _process_samplesheets(dname, config):
         samplesheet.csv2yaml(ss_file, out_file)
 
 
-def _generate_fastq_with_casava(fc_dir, config, r1=False):
+def _generate_fastq_with_casava_task(args):
     """Perform demultiplexing and generate fastq.gz files for the current
     flowecell using CASAVA (>1.8).
     """
+    bp = args.get('bp')
+    samples_group = args.get('samples')
+    base_mask = samples_group['base_mask']
+    samples = samples_group['samples']
+    fc_dir = args.get('fc_dir')
+    config = args.get('config')
+    r1 = args.get('r1', False)
+    ss = 'SampleSheet_{bp}bp.csv'.format(bp=str(bp))
+    unaligned_folder = 'Unaligned_{bp}bp'.format(bp=str(bp))
+    out_file = 'configureBclToFastq_{bp}bp.out'.format(bp=str(bp))
+    err_file = 'configureBclToFastq_{bp}bp.err'.format(bp=str(bp))
+
+    #Prepare CL arguments and call configureBclToFastq
     basecall_dir = os.path.join(fc_dir, "Data", "Intensities", "BaseCalls")
     casava_dir = config["program"].get("casava")
-    unaligned_dir = os.path.join(fc_dir, "Unaligned")
-    samplesheet_file = samplesheet.run_has_samplesheet(fc_dir, config)
+    unaligned_dir = os.path.join(fc_dir, unaligned_folder)
+    samplesheet_file = os.path.join(fc_dir, ss)
     num_mismatches = config["algorithm"].get("mismatches", 1)
     num_cores = config["algorithm"].get("num_cores", 1)
     im_stats = config["algorithm"].get("ignore-missing-stats", False)
@@ -414,8 +447,8 @@ def _generate_fastq_with_casava(fc_dir, config, r1=False):
     im_control = config["algorithm"].get("ignore-missing-control", False)
 
     # Write to log files
-    configure_out = os.path.join(fc_dir, "configureBclToFastq.out")
-    configure_err = os.path.join(fc_dir, "configureBclToFastq.err")
+    configure_out = os.path.join(fc_dir, out_file)
+    configure_err = os.path.join(fc_dir, err_file)
     casava_out = os.path.join(fc_dir, "bclToFastq_R{:d}.out".format(2 - int(r1)))
     casava_err = os.path.join(fc_dir, "bclToFastq_R{:d}.err".format(2 - int(r1)))
 
@@ -436,11 +469,16 @@ def _generate_fastq_with_casava(fc_dir, config, r1=False):
     if im_control:
         cl.append("--ignore-missing-control")
 
-    bm = _get_bases_mask(fc_dir)
-    if bm is not None:
-        cl.extend(["--use-bases-mask", bm])
+    if base_mask is not None:
+        cl.extend(["--use-bases-mask", ','.join(base_mask)])
 
     if r1:
+        #Create separate samplesheet and folder
+        with open(os.path.join(fc_dir, ss), 'w') as fh:
+            samplesheet = csv.DictWriter(fh, fieldnames=samples['fieldnames'], dialect='excel')
+            samplesheet.writeheader()
+            samplesheet.writerows(samples['samples'])
+
         # Run configuration script
         logger2.info("Configuring BCL to Fastq conversion")
         logger2.debug(cl)
@@ -461,9 +499,8 @@ def _generate_fastq_with_casava(fc_dir, config, r1=False):
         finally:
             co.close()
             ce.close()
-            
 
-    # Go to <Unaligned> folder
+   # Go to <Unaligned> folder
     with utils.chdir(unaligned_dir):
         # Perform make
         cl = ["make", "-j", str(num_cores)]
@@ -493,6 +530,26 @@ def _generate_fastq_with_casava(fc_dir, config, r1=False):
 
     logger2.debug("Done")
     return unaligned_dir
+
+
+def _generate_fastq_with_casava(fc_dir, config, r1=False):
+    """Prepare and call the task to perform demultiplexing and generation of
+    fastq.gz files for the current flowcell in using CASAVA (>1.8). If the
+    number of cores specified is > 1, the demultiplexing will be done in
+    parallel.
+    """
+        
+    base_masks = _get_bases_mask(fc_dir)
+    num_cores = config["algorithm"].get("num_cores", 1)
+    #Prepare the list of arguments to call configureBclToFastq
+    args_list = []
+    [args_list.append({'bp': k, 'samples': v, 'fc_dir':fc_dir, 'config':config, 'r1':r1}) \
+                        for k, v in base_masks.iteritems()]
+
+    p = Pool(processes=num_cores)
+    unaligned_dirs = p.map(_generate_fastq_with_casava_task, args_list)
+
+    return unaligned_dirs
 
 
 def _generate_fastq(fc_dir, config, compress_fastq):
@@ -669,7 +726,9 @@ def _is_finished_basecalling_read(directory, readno):
 def _do_initial_processing(directory):
     """Determine if the initial processing actions should be run
     """
-    return (_is_finished_first_base_report(directory) and
+    # A miseq run does not generate a first base report 
+    return ((_is_miseq_run(directory) or 
+             _is_finished_first_base_report(directory)) and
             not _is_started_initial_processing(directory))
 
 
@@ -706,6 +765,16 @@ def _expected_reads(directory):
     """
     return len(_get_read_configuration(directory))
 
+def _is_miseq_run(fcdir):
+    """Return True if this is a miseq run folder, False otherwise
+    """
+    if not _is_run_folder_name(os.path.basename(fcdir)):
+        return False
+    
+    # Assume that a HiSeq run folder ends with [AB][A-Z0-9]XX and that it is a MiSeq folder otherwise
+    p = os.path.basename(fcdir).split("_")[-1]
+    m = re.match(r'[AB][A-Z0-9]+XX',p)
+    return (m is None)
 
 def _is_finished_dumping_checkpoint(directory):
     """Recent versions of RTA (1.10 or better), write the complete file.
@@ -741,33 +810,104 @@ def _get_read_configuration(directory):
     return sorted(reads, key=lambda r: int(r.get("Number", 0)))
 
 
+def _get_flowcell_id(directory):
+    """Parese the RunInfo.xml and return the Flowcell ID
+    """
+    run_info_file = os.path.join(directory, "RunInfo.xml")
+    flowcell_id = ''
+    if os.path.exists(run_info_file):
+        tree = ET.ElementTree()
+        tree.parse(run_info_file)
+        flowcell_id = tree.find("Run/Flowcell").text
+    return flowcell_id
+
+
 def _get_bases_mask(directory):
-    """Get the base mask to use with Casava based on the run configuration
+    """Get the base mask to use with Casava based on the run configuration and
+    on the run SampleSheet
     """
     runsetup = _get_read_configuration(directory)
+    flowcell_id = _get_flowcell_id(directory)
+    base_masks = {}
 
-    # Handle the cases we know what to do with, otherwise, let Casava figure out
-    # Case 1: 2x101 PE
-    if (len(runsetup) == 3 and
-        (runsetup[0]["NumCycles"] == "101" and runsetup[0]["IsIndexedRead"] == "N") and
-        (runsetup[1]["NumCycles"] == "7" and runsetup[1]["IsIndexedRead"] == "Y") and
-        (runsetup[2]["NumCycles"] == "101" and runsetup[2]["IsIndexedRead"] == "N")):
-        return "Y101,I6n,Y101"
+    #Create groups of reads by index length
+    ss_name = os.path.join(directory, str(flowcell_id) + '.csv')
+    if os.path.exists(ss_name):
+        ss = csv.DictReader(open(ss_name, 'rb'), delimiter=',')
+        samplesheet = []
+        [samplesheet.append(read) for read in ss]
+        for r in samplesheet:
+            index_length = len(r['Index'].replace('-', ''))
+            if not base_masks.has_key(index_length):
+                base_masks[index_length] = {'base_mask': [],
+                                            'samples': {'fieldnames': ss.fieldnames, 'samples':[]}}
+            base_masks[index_length]['samples']['samples'].append(r)
 
-    # Case 2: 2x101 PE, dual indexing
-    if (len(runsetup) == 4 and
-        (runsetup[0]["NumCycles"] == "101" and runsetup[0]["IsIndexedRead"] == "N") and
-        (runsetup[1]["NumCycles"] == "8" and runsetup[1]["IsIndexedRead"] == "Y") and
-        (runsetup[2]["NumCycles"] == "8" and runsetup[2]["IsIndexedRead"] == "Y") and
-        (runsetup[3]["NumCycles"] == "101" and runsetup[3]["IsIndexedRead"] == "N")):
-        return "Y101,I8,I8,Y101"
-
-    return None
+    #Create the basemask for each group
+    for index_size, index_group in base_masks.iteritems():
+        index_size = index_size
+        group = index_size
+        bm = []
+        for read in runsetup:
+            cycles = read['NumCycles']
+            if read['IsIndexedRead'] == 'N':
+                bm.append('Y' + cycles)
+            else:
+                if index_size > 0:
+                    if index_size < int(cycles):
+                        m = 'I' + str(index_size) + 'N'
+                        if int(cycles) - index_size > 1:
+                            bm.append(m + str(int(cycles) - index_size))
+                        else:
+                            bm.append(m)
+                        index_size = 0
+                    elif index_size >= int(cycles):
+                        bm.append('I' + cycles)
+                        index_size = index_size - int(cycles)
+                else:
+                    bm.append('N' + cycles)
+        base_masks[group]['base_mask'] = bm
+    return base_masks
 
 
 def _files_to_copy(directory):
     """Retrieve files that should be remotely copied.
     """
+
+    #First include the files in the root directory, otherwise
+    #the --include=*/ makes a match with all subdirectories
+    #with extension txt, csv, err or out
+    with utils.chdir(directory):
+        root_files = reduce(operator.add,
+                            [glob.glob("*.xml"),
+                             glob.glob("*.csv"),
+                             glob.glob("*.txt"),
+                             glob.glob("*.err"),
+                             glob.glob("*.out")])
+
+    reports = ["Data/Intensities/BaseCalls/*.xml", \
+                "Data/Intensities/BaseCalls/*.xsl", \
+                "Data/Intensities/BaseCalls/*.htm", \
+                "Unaligned*/Basecall_Stats_*/*", \
+                "Unaligned*/Basecall_Stats_*/**/*", \
+                "Data/Intensities/BaseCalls/Plots", \
+                "Data/reports", \
+                "Data/Status.htm", \
+                "Data/Status_Files", "InterOp"]
+
+    run_info = ["run_info.yaml", \
+                "Unaligned*/Project_*/**/*.csv", \
+                "Unaligned*/Undetermined_indices/**/*.csv"]
+
+    fastq = ["Data/Intensities/BaseCalls/*fastq.gz", \
+            "Unaligned*/Project_*/**/*.fastq.gz", \
+            "Unaligned*/Undetermined_indices/**/*.fastq.gz", \
+            "Data/Intensities/BaseCalls/fastq"]
+
+    analysis = ["Data/Intensities/BaseCalls/Alignment"]
+
+    patterns = root_files + reports + run_info + fastq + analysis
+
     with utils.chdir(directory):
         image_redo_files = reduce(operator.add,
                                   [glob.glob("*.params"),
@@ -785,7 +925,7 @@ def _files_to_copy(directory):
                          glob.glob("Data/Intensities/BaseCalls/*.xsl"),
                          glob.glob("Data/Intensities/BaseCalls/*.htm"),
                          glob.glob("Unaligned*/Basecall_Stats_*/*"),
-                         glob.glob("Unalgiend*/Basecall_Stats_*/**/*"),
+                         glob.glob("Unaligned*/Basecall_Stats_*/**/*"),
                          ["Data/Intensities/BaseCalls/Plots", "Data/reports",
                           "Data/Status.htm", "Data/Status_Files", "InterOp"]
                         ])
@@ -802,18 +942,12 @@ def _files_to_copy(directory):
 
         logs = reduce(operator.add, [["Logs", "Recipe", "Diag", "Data/RTALogs", "Data/Log.txt"]])
 
-        fastq = reduce(operator.add,
-                        [glob.glob("Data/Intensities/BaseCalls/*fastq.gz"),
-                         glob.glob("Unaligned*/Project_*/**/*.fastq.gz"),
-                         glob.glob("Unaligned*/Undetermined_indices/**/*.fastq.gz"),
-                         ["Data/Intensities/BaseCalls/fastq"]
-                        ])
 
-        analysis = reduce(operator.add, [glob.glob("Data/Intensities/BaseCalls/Alignment")])
-
+    #For process_files return a list of patterns to be included in the rsync command
+    #instead of including the list of corresponding files. Otherwise the rsync
+    #command becomes too long
     return (sorted(image_redo_files + logs + reports + run_info + qseqs),
-            sorted(reports + fastq + run_info + analysis),
-            ["*"])
+            patterns, ["*"])
 
 
 def _read_reported(msg_db):
@@ -824,14 +958,21 @@ def _read_reported(msg_db):
         with open(msg_db) as in_handle:
             for line in in_handle:
                 reported.append(line.strip())
+    else:
+        # Just check if the path to the file exists
+        utils.safe_makedir(os.path.dirname(msg_db))
+        open(msg_db, 'w')
     return reported
 
+def _is_run_folder_name(name):
+    """Check if a name matches the format of *iSeq run folders"""
+    m = re.match("\d{6}_[A-Za-z0-9]+_\d+_[AB]?[A-Z0-9\-]+", name)
+    return (m is not None)
 
 def _get_directories(config):
     for directory in config["dump_directories"]:
         for fpath in sorted(os.listdir(directory)):
-            m = re.match("\d{6}_[A-Za-z0-9]+_\d+_[AB]?[A-Z0-9\-]+", fpath)
-            if not os.path.isdir(os.path.join(directory, fpath)) or m is None:
+            if not os.path.isdir(os.path.join(directory, fpath)) or not _is_run_folder_name(fpath):
                 continue
             yield os.path.join(directory, fpath)
 
@@ -958,7 +1099,7 @@ class TestCallsTo_post_process_run(unittest.TestCase):
 
     def test_call_in_initial_processing(self):
         args = ["", None, ""]  # [dname, config, local_config]
-        self.assertRaises(OSError, initial_processing, *args, **self.kwargs)
+        self.assertRaises(ValueError, initial_processing, *args, **self.kwargs)
 
     def test_call_as_in_process_first_read(self):
         args = ["", None, "", ""]  # [dname, config, local_config, unaligned_dir]
@@ -995,45 +1136,74 @@ class TestCheckpoints(unittest.TestCase):
                                                         "SurfaceCount": "2",
                                                         "SwathCount": "3",
                                                         "TileCount": "16"}))
-        
+
         et = ET.ElementTree(root)
         et.write(outfile,encoding="UTF-8")
         return outfile
-        
+
+
+    @classmethod
+    def _samplesinfo(cls, outfile, index_info='simple_index'):
+        """Return a csv string representing the contents of a samples csv file
+        with the specified index configuration.
+        """
+        fn = ['FCID', 'Lane', 'SampleID', 'SampleRef', 'Index', 'Description', \
+              'Control', 'Recipe', 'Operator', 'SampleProject']
+        sample = "C1NWWACXX,1,P352_184B_index12,hg19,{index},J_Doe_13_01,N,R1,NN,J_Doe_13_01"
+        with open(outfile, 'w') as samplesheet:
+            ss = csv.DictWriter(samplesheet, fieldnames=fn, dialect='excel')
+            ss.writeheader()
+            #Write samples according to index configuration
+            rows = []
+            if index_info == 'simple_index':
+                s1 = sample.format(index='ACGTAG').split(',')
+                rows = [s1]
+            elif index_info == 'mixed_index':
+                s1 = sample.format(index='ACGTAG').split(',')
+                s2 = sample.format(index='ACGTACGT').split(',')
+                s3 = sample.format(index='ACGTACGT-ACGTACGT').split(',')
+                rows = [s1, s2, s3]
+            elif index_info == 'no_index':
+                s1 = sample.format(index='').split(',')
+                rows = [s1]
+            ss.writerows([{k:v for k,v in izip(fn,r)} for r in rows])
+        return outfile
+
+
     @classmethod
     def setUpClass(cls):
         cls.basedir = tempfile.mkdtemp(prefix="ifm_test_checkpoints_base_")
-        
+
     @classmethod
     def tearDownClass(cls):
         shutil.rmtree(cls.basedir)
-        
+
     def test__is_finished_first_base_report(self):
         """First base report"""
         self.assertFalse(_is_finished_first_base_report(self.rootdir))
         utils.touch_file(os.path.join(self.rootdir,"First_Base_Report.htm"))
         self.assertTrue(_is_finished_first_base_report(self.rootdir))
-        
+
     def test__is_started_initial_processing(self):
         """Initial processing started"""
         self.assertFalse(_is_started_initial_processing(self.rootdir))
         utils.touch_indicator_file(os.path.join(self.rootdir,"initial_processing_started.txt"))
         self.assertTrue(_is_started_initial_processing(self.rootdir))
-        
+
     def test__is_started_first_read_processing(self):
         """First read processing started
         """
         self.assertFalse(_is_started_first_read_processing(self.rootdir))
         utils.touch_indicator_file(os.path.join(self.rootdir,"first_read_processing_started.txt"))
         self.assertTrue(_is_started_first_read_processing(self.rootdir))
-        
+
     def test__is_started_second_read_processing(self):
         """Second read processing started
         """
         self.assertFalse(_is_started_second_read_processing(self.rootdir))
         utils.touch_indicator_file(os.path.join(self.rootdir,"second_read_processing_started.txt"))
         self.assertTrue(_is_started_second_read_processing(self.rootdir))
-    
+
     def test__is_initial_processing(self):
         """Initial processing in progress"""
         self.assertFalse(_is_initial_processing(self.rootdir),
@@ -1044,7 +1214,7 @@ class TestCheckpoints(unittest.TestCase):
         utils.touch_indicator_file(os.path.join(self.rootdir,"initial_processing_completed.txt"))
         self.assertFalse(_is_initial_processing(self.rootdir),
                         "Completed indicator file should not indicate processing in progress")
-        
+
     def test__is_processing_first_read(self):
         """First read processing in progress
         """
@@ -1056,7 +1226,7 @@ class TestCheckpoints(unittest.TestCase):
         utils.touch_indicator_file(os.path.join(self.rootdir,"first_read_processing_completed.txt"))
         self.assertFalse(_is_processing_first_read(self.rootdir),
                         "Completed indicator file should not indicate processing in progress")
-        
+
     def test__do_initial_processing(self):
         """Initial processing logic
         """
@@ -1124,56 +1294,56 @@ class TestCheckpoints(unittest.TestCase):
                                                 "second_read_processing_started.txt"))
         self.assertFalse(_do_second_read_processing(self.rootdir),
                          "Processing should not be run when processing has started")
-        
+
     def test__expected_reads(self):
         """Get expected number of reads
         """
         self.assertEqual(_expected_reads(self.rootdir),0,
                          "Non-existant RunInfo.xml should return 0 expected reads")
-        
+
         runinfo = os.path.join(self.rootdir,"RunInfo.xml")
         self._runinfo(runinfo)
         self.assertEqual(_expected_reads(self.rootdir),3,
                          "Default RunInfo.xml should return 3 expected reads")
-        
+
         self._runinfo(runinfo, "Y101,I6,I6,Y101")
-        
+
         self.assertEqual(_expected_reads(self.rootdir),4,
                          "Dual-index RunInfo.xml should return 4 expected reads")
-        
+
     def test__last_index_read(self):
         """Get number of last index read
         """
         self.assertEqual(_last_index_read(self.rootdir),0,
                          "Non-existant RunInfo.xml should return 0 as last index read")
-        
+
         runinfo = os.path.join(self.rootdir,"RunInfo.xml")
         self._runinfo(runinfo)
         self.assertEqual(_last_index_read(self.rootdir),2,
                          "Default RunInfo.xml should return 2 as last index read")
-        
+
         self._runinfo(runinfo, "Y101,I6,I6,Y101")
         self.assertEqual(_last_index_read(self.rootdir),3,
                          "Dual-index RunInfo.xml should return 3 as last expected read")
-        
+
         self._runinfo(runinfo, "Y101,Y101,Y101")
         self.assertEqual(_last_index_read(self.rootdir),0,
                          "Non-index RunInfo.xml should return 0 as last expected read")
-        
+
     def test__is_finished_basecalling_read(self):
         """Detect finished read basecalling
         """
-        
-        # Create a custom RunInfo.xml in the current directory    
+
+        # Create a custom RunInfo.xml in the current directory
         runinfo = os.path.join(self.rootdir,"RunInfo.xml")
         self._runinfo(runinfo, "Y101,Y101")
-        
+
         with self.assertRaises(ValueError):
             _is_finished_basecalling_read(self.rootdir,0)
-         
+
         with self.assertRaises(ValueError):
             _is_finished_basecalling_read(self.rootdir,3)
-        
+
         for read in (1,2):
             self.assertFalse(_is_finished_basecalling_read(self.rootdir,read),
                              "Should not return true with missing indicator file")
@@ -1181,37 +1351,45 @@ class TestCheckpoints(unittest.TestCase):
                                           "Basecalling_Netcopy_complete_Read{:d}.txt".format(read)))
             self.assertTrue(_is_finished_basecalling_read(self.rootdir,read),
                             "Should return true with existing indicator file")
-            
+
     def test__get_bases_mask(self):
         """Get bases mask
         """
-        runinfo = os.path.join(self.rootdir,"RunInfo.xml")
-        
+        runinfo = os.path.join(self.rootdir, "RunInfo.xml")
         self._runinfo(runinfo)
-        self.assertEqual(_get_bases_mask(self.rootdir),"Y101,I6n,Y101",
-                         "Unexpected bases mask for 2x100 PE")
-        
-        self._runinfo(runinfo, "Y101,I8,I8,Y101")
-        self.assertEqual(_get_bases_mask(self.rootdir),"Y101,I8,I8,Y101",
-                         "Unexpected bases mask for 2x100 PE - Dual index")
-        
-        self._runinfo(runinfo, "Y10,I2,Y10")
-        self.assertIsNone(_get_bases_mask(self.rootdir),
-                        "Expected empty bases mask from unknown run configuration")
-    
+        flowcell_id = _get_flowcell_id(self.rootdir)
+        samplesinfo = os.path.join(self.rootdir, str(flowcell_id) + '.csv')
+        #Test simple index
+        self._samplesinfo(samplesinfo)
+        self.assertEqual(_get_bases_mask(self.rootdir)[6]['base_mask'], ['Y101', 'I6N', 'Y101'])
+        #Test mixed indexes
+        self._runinfo(runinfo, bases_mask='Y101,I8,I8,Y101')
+        self._samplesinfo(samplesinfo, index_info='mixed_index')
+        masks = _get_bases_mask(self.rootdir)
+        self.assertEqual(masks[6]['base_mask'], ['Y101', 'I6N2', 'N8', 'Y101'])
+        self.assertEqual(masks[8]['base_mask'], ['Y101', 'I8', 'N8', 'Y101'])
+        self.assertEqual(masks[16]['base_mask'], ['Y101', 'I8', 'I8', 'Y101'])
+        #Test no index
+        self._runinfo(runinfo, bases_mask='Y101,Y101')
+        self._samplesinfo(samplesinfo, index_info='no_index')
+        self.assertEqual(_get_bases_mask(self.rootdir)[0]['base_mask'], ['Y101', 'Y101'])
+
+
+
+
     def test__get_read_configuration(self):
         """Get read configuration
         """
-        
+
         self.assertListEqual(_get_read_configuration(self.rootdir), [],
                              "Expected empty list for non-existing RunInfo.xml")
-        
+
         runinfo = os.path.join(self.rootdir,"RunInfo.xml")
         self._runinfo(runinfo)
         obs_reads = _get_read_configuration(self.rootdir)
         self.assertListEqual([r.get("Number",0) for r in obs_reads],["1","2","3"],
                              "Expected 3 reads for 2x100 PE")
-        
+
     def test__get_directories(self):
         """Get run output directories
         """
@@ -1223,8 +1401,10 @@ class TestCheckpoints(unittest.TestCase):
         obs_dirs = [d for d in _get_directories(config)]
         self.assertListEqual([],obs_dirs,
                               "Should not pick up files, only directories")
-        exp_dirs = [os.path.join(self.rootdir, "222222_SN222_2222_A2222222")]
+        exp_dirs = [os.path.join(self.rootdir, "222222_SN222_2222_A2222222"),
+                    os.path.join(self.rootdir, "333333_D0023_3333_B33333XX")]
         os.mkdir(exp_dirs[-1])
+        os.mkdir(exp_dirs[-2])
         obs_dirs = [d for d in _get_directories(config)]
         self.assertListEqual(sorted(exp_dirs),sorted(obs_dirs),
                               "Should pick up matching directory - hiseq-style")
