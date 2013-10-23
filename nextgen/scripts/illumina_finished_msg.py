@@ -34,7 +34,6 @@ import xml.etree.ElementTree as ET
 import re
 import csv
 from shutil import copyfile
-from multiprocessing import Pool
 from itertools import izip
 
 import logbook
@@ -52,9 +51,6 @@ try:
 except ImportError:
     pass
 
-LOG_NAME = os.path.splitext(os.path.basename(__file__))[0]
-log = logbook.Logger(LOG_NAME)
-
 
 def main(*args, **kwargs):
     local_config = args[0]
@@ -63,7 +59,7 @@ def main(*args, **kwargs):
     config = load_config(local_config)
 
     log_handler = create_log_handler(config, True)
-    with log_handler.applicationbound():
+    with log_handler.threadbound():
         search_for_new(config, local_config, **kwargs)
 
 
@@ -72,6 +68,7 @@ def search_for_new(*args, **kwargs):
     """
     config = args[0]
     reported = _read_reported(config["msg_db"])
+    process_all_option = config["algorithm"].get("process_all", False)
     for dname in _get_directories(config):
         # Only process a directory if it isn't listed in the transfer db or if it was specifically requested
         # on the command line
@@ -92,18 +89,24 @@ def search_for_new(*args, **kwargs):
                 if _do_initial_processing(dname):
                     initial_processing(dname, *args, **kwargs)
 
-                elif _do_first_read_processing(dname):
-                    process_first_read(dname, *args, **kwargs)
+                if not process_all_option:
+                    if _do_first_read_processing(dname):
+                        process_first_read(dname, *args, **kwargs)
 
-                elif _do_second_read_processing(dname):
-                    process_second_read(dname, *args, **kwargs)
+                    elif _do_second_read_processing(dname):
+                        process_second_read(dname, *args, **kwargs)
+                    else:
+                        pass
                 else:
-                    pass
+                    #Process both reads at once in the same machine
+                    if _is_finished_dumping_checkpoint(dname):
+                        process_all(dname, *args, **kwargs)
+
 
                 # Re-read the reported database to make sure it hasn't
                 # changed while processing.
                 reported = _read_reported(config["msg_db"])
-    
+
 def initial_processing(*args, **kwargs):
     """Initial processing to be performed after the first base report
     """
@@ -133,7 +136,7 @@ def initial_processing(*args, **kwargs):
         # If the module wasn't loaded, there's nothing we can do, so warn
         else:
             logger2.error("The necessary dependencies for processing MiSeq runs with CASAVA could not be loaded")
-    
+
     # Upload the necessary files
     loc_args = args + (None, )
     _post_process_run(*loc_args, **{"fetch_msg": kwargs.get("fetch_msg", False),
@@ -180,7 +183,7 @@ def process_first_read(*args, **kwargs):
 
 
 def process_second_read(*args, **kwargs):
-    """Processing to be performed after all reads have been sequences
+    """Processing to be performed after all reads have been sequenced
     """
     dname, config = args[0:2]
     logger2.info("The instrument has finished dumping on directory %s" % dname)
@@ -194,6 +197,36 @@ def process_second_read(*args, **kwargs):
         if not kwargs.get("no_casava_processing", False):
             logger2.info("Generating fastq.gz files for {:s}".format(dname))
             _generate_fastq_with_casava(dname, config)
+            # Merge demultiplexing results into a single Unaligned folder
+            utils.merge_demux_results(dname)
+            #Move the demultiplexing results
+            if config.has_key('mfs_dir'):
+                fc_id = os.path.basename(dname)
+                cl = ["rsync", \
+                      "--checksum", \
+                      "--recursive", \
+                      "--links", \
+                      "-D", \
+                      "--partial", \
+                      "--progress", \
+                      "--prune-empty-dirs", \
+                      os.path.join(dname, 'Unaligned'), \
+                      os.path.join(config.get('mfs_dir'), fc_id)
+                      ]
+                logger2.info("Synching Unaligned folder to MooseFS for run {}".format(fc_id))
+                logdir = os.path.join(config.get('log_dir'), os.getcwd())
+                rsync_out = os.path.join(logdir,"rsync_transfer.out")
+                rsync_err = os.path.join(logdir,"rsync_transfer.err")
+
+                with open(rsync_out, 'a') as ro:
+                    with open(rsync_err, 'a') as re:
+                        try:
+                            ro.write("-----------\n{}\n".format(" ".join(cl)))
+                            re.write("-----------\n{}\n".format(" ".join(cl)))
+                            subprocess.check_call(cl, stdout=ro, stderr=re)
+                        except subprocess.CalledProcessError, e:
+                            logger2.error("rsync transfer of Unaligned results FAILED")
+
 
     else:
         _process_samplesheets(dname, config)
@@ -222,12 +255,22 @@ def process_second_read(*args, **kwargs):
     utils.touch_indicator_file(os.path.join(dname, "second_read_processing_completed.txt"))
 
 
+def process_all(*args, **kwargs):
+    """Process to be done after all reads have been sequenced.
+
+    It does the whole processing at once (first and second read), on the same machine.
+    """
+    dname, config = args[0:2]
+    process_first_read(*args, **kwargs)
+    process_second_read(*args, **kwargs)
+
+
 def extract_top_undetermined_indexes(fc_dir, unaligned_dir, config):
     """Extract the top N=25 barcodes from the undetermined indices output
     """
     infile_glob = os.path.join(unaligned_dir, "Undetermined_indices", "Sample_lane*", "*_R1_*.fastq.gz")
     infiles = glob.glob(infile_glob)
-    
+
     # Only run as many simultaneous processes as number of cores specified in config
     procs = []
     num_cores = config["algorithm"].get("num_cores", 1)
@@ -349,7 +392,9 @@ def simple_upload(remote_info, data):
 
     cl = ["rsync", \
           "--checksum", \
-          "--archive", \
+          "--recursive", \
+          "--links", \
+          "-D", \
           "--partial", \
           "--progress", \
           "--prune-empty-dirs"
@@ -438,7 +483,11 @@ def _generate_fastq_with_casava_task(args):
     #Prepare CL arguments and call configureBclToFastq
     basecall_dir = os.path.join(fc_dir, "Data", "Intensities", "BaseCalls")
     casava_dir = config["program"].get("casava")
-    unaligned_dir = os.path.join(fc_dir, unaligned_folder)
+    out_dir = config.get("out_directory", fc_dir)
+    #Append the flowcell dir to the output directory if different from the run dir
+    if out_dir != fc_dir:
+        out_dir = os.path.join(out_dir, os.path.basename(fc_dir))
+    unaligned_dir = os.path.join(out_dir, unaligned_folder)
     samplesheet_file = os.path.join(fc_dir, ss)
     num_mismatches = config["algorithm"].get("mismatches", 1)
     num_cores = config["algorithm"].get("num_cores", 1)
@@ -538,7 +587,7 @@ def _generate_fastq_with_casava(fc_dir, config, r1=False):
     number of cores specified is > 1, the demultiplexing will be done in
     parallel.
     """
-        
+
     base_masks = _get_bases_mask(fc_dir)
     num_cores = config["algorithm"].get("num_cores", 1)
     #Prepare the list of arguments to call configureBclToFastq
@@ -546,8 +595,7 @@ def _generate_fastq_with_casava(fc_dir, config, r1=False):
     [args_list.append({'bp': k, 'samples': v, 'fc_dir':fc_dir, 'config':config, 'r1':r1}) \
                         for k, v in base_masks.iteritems()]
 
-    p = Pool(processes=num_cores)
-    unaligned_dirs = p.map(_generate_fastq_with_casava_task, args_list)
+    unaligned_dirs = map(_generate_fastq_with_casava_task, args_list)
 
     return unaligned_dirs
 
@@ -726,8 +774,8 @@ def _is_finished_basecalling_read(directory, readno):
 def _do_initial_processing(directory):
     """Determine if the initial processing actions should be run
     """
-    # A miseq run does not generate a first base report 
-    return ((_is_miseq_run(directory) or 
+    # A miseq run does not generate a first base report
+    return ((_is_miseq_run(directory) or
              _is_finished_first_base_report(directory)) and
             not _is_started_initial_processing(directory))
 
@@ -770,7 +818,7 @@ def _is_miseq_run(fcdir):
     """
     if not _is_run_folder_name(os.path.basename(fcdir)):
         return False
-    
+
     # Assume that a HiSeq run folder ends with [AB][A-Z0-9]XX and that it is a MiSeq folder otherwise
     p = os.path.basename(fcdir).split("_")[-1]
     m = re.match(r'[AB][A-Z0-9]+XX',p)
@@ -888,6 +936,7 @@ def _files_to_copy(directory):
     reports = ["Data/Intensities/BaseCalls/*.xml", \
                 "Data/Intensities/BaseCalls/*.xsl", \
                 "Data/Intensities/BaseCalls/*.htm", \
+                "Unaligned*/*.xml", \
                 "Unaligned*/Basecall_Stats_*/*", \
                 "Unaligned*/Basecall_Stats_*/**/*", \
                 "Data/Intensities/BaseCalls/Plots", \
