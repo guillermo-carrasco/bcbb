@@ -24,6 +24,7 @@ install:
 
 notifications:
     email: false
+    flowdock: 53e94ab38376e5212b2617869a6643fe
 
 before_script:
     - cd tests
