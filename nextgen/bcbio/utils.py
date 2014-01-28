@@ -394,8 +394,21 @@ def merge_demux_results(fc_dir):
                     'Flowcell_demux_summary.xml'), merged_basecall_dir)
     shutil.copy(os.path.join(unaligned_dirs[0], basecall_dir,
                     'Demultiplex_Stats.htm'), merged_basecall_dir)
-    shutil.copy(os.path.join(unaligned_dirs[0], basecall_dir,
+    #The file Undemultiplexed_stats.metrics may not always be there.
+    u_s_file = os.path.exists(os.path.join(unaligned_dirs[0], basecall_dir,
+                            'Undemultiplexed_stats.metrics'))
+    if u_s_file:
+        shutil.copy(os.path.join(unaligned_dirs[0], basecall_dir,
                     'Undemultiplexed_stats.metrics'), merged_basecall_dir)
+        #And it is possible that it is empty, in which case we have to add
+        #the header
+        u_s_file_final = os.path.join(merged_basecall_dir, 'Undemultiplexed_stats.metrics')
+        with open(u_s_file_final, 'r') as f:
+            content = f.readlines()
+            header = ['lane', 'sequence', 'count', 'index_name']
+            if content and content[0].split() != header:
+                with open(u_s_file_final, 'w') as final:
+                    final.writelines('\t'.join(header) + '\n')
     if len(unaligned_dirs) > 1:
         for u in unaligned_dirs[1:]:
             #Merge Flowcell_demux_summary.xml
@@ -410,7 +423,8 @@ def merge_demux_results(fc_dir):
                     m_demultiplex_stats.renderContents()))
 
             #Merge Undemultiplexed_stats.metrics
-            merge_undemultiplexed_stats_metrics(merged_dir, u, fc_id)
+            if u_s_file:
+                merge_undemultiplexed_stats_metrics(merged_dir, u, fc_id)
 
 # UTF-8 methods for csv module (does not support it in python >2.7)
 # http://docs.python.org/library/csv.html#examples

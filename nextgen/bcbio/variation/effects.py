@@ -27,12 +27,14 @@ def snpeff_effects(vcf_in, genome, config):
     """Prepare tab-delimited file for variant effects using snpEff.
     """
     interval_file = config["algorithm"].get("hybrid_target", None)
-    if _vcf_has_items(vcf_in):
+    if _vcf_has_items(vcf_in) and config["algorithm"].get("variation_effects",True):
         se_interval = (_convert_to_snpeff_interval(interval_file, vcf_in)
                        if interval_file else None)
         try:
             snpeff_data_dir = os.path.join(config["program"]["snpEff"], "data")
-            for snpeff_genome in SNPEFF_GENOME_REMAP[genome]:
+            snpeff_genome_remap = config.get("resources",{}).get("snpEff",{}).get("genome_remap",SNPEFF_GENOME_REMAP)
+            assert genome in snpeff_genome_remap, log.error("The genome {} is not present in the SnpEff genome dictionary.")
+            for snpeff_genome in snpeff_genome_remap[genome]:
                 if os.path.exists(os.path.join(snpeff_data_dir, snpeff_genome)):
                     break
             vcf_file = _run_snpeff(vcf_in, snpeff_genome, se_interval, "vcf", config)
