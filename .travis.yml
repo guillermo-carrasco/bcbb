@@ -20,6 +20,7 @@ install:
     - pip install cython
     - pip install --allow-external pysam==0.7
     - pip install python-dateutil
+    - pip install paramiko==1.12
     - cd nextgen && python setup.py install
 
 notifications:
