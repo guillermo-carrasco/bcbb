@@ -60,8 +60,15 @@ def main(*args, **kwargs):
 
     log_handler = create_log_handler(config, True)
     with log_handler.threadbound():
-        search_for_new(config, local_config, **kwargs)
-
+        if not kwargs['transfer_run']:
+            search_for_new(config, local_config, **kwargs)
+        else:
+            run = None if not kwargs['run_id'] else kwargs['run_id']
+            if not run:
+                logger2.error("--transfer-info needs a --run-id to transfer. Please specify a run id.")
+            else:
+                logger2.info("Transfering run {} to UPPMAX".format(run))
+                #XXX To transfer the files
 
 def search_for_new(*args, **kwargs):
     """Search for any new unreported directories.
@@ -1166,6 +1173,8 @@ if __name__ == "__main__":
             action="store", default=None)
     parser.add_option("--no-casava-processing", dest="no_casava_processing",
             action="store_true", default=False)
+    parser.add_option("--transfer-run", dest="transfer_run",
+            action="store_true", default=False)
 
     (options, args) = parser.parse_args()
 
@@ -1191,7 +1200,8 @@ if __name__ == "__main__":
               "push_data": options.push_data, \
               "post_process_only": options.post_process_only, \
               "run_id": options.run_id, \
-              "no_casava_processing": options.no_casava_processing}
+              "no_casava_processing": options.no_casava_processing, \
+              "transfer_run": options.transfer_run}
 
     main(*args, **kwargs)
 
